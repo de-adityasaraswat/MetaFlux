@@ -6,7 +6,9 @@ from jinja2 import Environment, BaseLoader
 from .models import PipelineConfig
 from .logger import get_logger, trace_execution
 import inspect
-from .interfaces import AbstractReader, AbstractWriter
+from .interfaces import AbstractReader, AbstractWriter, AbstractAnonymizer
+import copy
+
 
 class PipelineEngine:
     def __init__(self, spark, config_json: str):
@@ -28,6 +30,7 @@ class PipelineEngine:
         # Automatic Plugin Discovery
         self._readers = {}
         self._writers = {}
+        self._anonymizers = {}
         self._discover_plugins()
 
     def _discover_plugins(self):
@@ -46,7 +49,8 @@ class PipelineEngine:
 
         search_targets = [
             f"{current_package}.reader_plugins",
-            f"{current_package}.writer_plugins"
+            f"{current_package}.writer_plugins",
+            f"{current_package}.anonymizer_plugins"
         ]
 
         for module_path in search_targets:
@@ -63,10 +67,17 @@ class PipelineEngine:
                         self.logger.info(f"Found Reader Plugin: {name} ({key})")
 
                     # Check if it's a Writer
-                    if issubclass(obj, AbstractWriter) and obj is not AbstractWriter:
+                    elif issubclass(obj, AbstractWriter) and obj is not AbstractWriter:
                         key = name.lower().replace('writer', '').strip('_')
                         self._writers[key] = obj()
                         self.logger.info(f"Found Writer Plugin: {name} ({key})")
+                        # 3. NEW: Check for Anonymizers (The missing piece!)
+                    elif issubclass(obj, AbstractAnonymizer) and obj is not AbstractAnonymizer:
+                        # Logic to strip 'anonymizer' from class name to create key
+                        # e.g., 'MaskEmailAnonymizer' -> 'mask_email'
+                        key = name.lower().replace('anonymizer', '').strip('_')
+                        self._anonymizers[key] = obj()
+                        self.logger.info(f"Found Anonymizer Plugin: {name} (key: {key})")
 
             except Exception as e:
                 # If a module doesn'_t exist (e.g. if user hasn't added writer_plugins), we log and move on
@@ -88,11 +99,80 @@ class PipelineEngine:
         self_date_format = '%Y-%m-%d %H:%M:%S'
         self.jinja_env.globals['now'] = lambda: datetime.now().strftime(self_date_format)
 
-    def register_reader(self,name: str, handler):
+    def register_reader(self, name: str, handler: AbstractReader):
+        """
+        Registers a custom Reader plugin.
+
+        :param name: The identifier used in JSON (e.g., 'csv_batch')
+        :param handler: An instance of an AbstractReader implementation
+        :raises ValueError: If name is invalid
+        :raises TypeError: If handler does not implement AbstractReader
+        """
+        # 1. Validate Name (Must be a non-empty string)
+        if not isinstance(name, str) or not name.strip():
+            raise ValueError(f"Reader name must be a non-empty string. Received: '{name}'")
+
+        # 2. Validate Handler Type (Ensures it implements the required interface)
+        if not isinstance(handler, AbstractReader):
+            raise TypeError(
+                f"Invalid handler for reader '{name}'. "
+                f"Expected AbstractReader instance, got {type(handler).__name__}."
+            )
+
+        # 3. Collision Detection (Warning if we are overwriting an existing plugin)
+        if name in self._readers:
+            self.logger.warning(f"CRITICAL: Overwriting existing Reader plugin with name: '{name}'")
+        else:
+            self.logger.info(f"Successfully registered Reader plugin: '{name}'")
+
         self._readers[name] = handler
 
-    def register_writer(self, type_name: str, handler):
+    def register_writer(self, type_name: str, handler: AbstractWriter):
+        """
+        Registers a custom Writer plugin.
+
+        :param type_name: The identifier used in JSON (e.g., 'csv_batch')
+        :param handler: An instance of an AbstractWriter implementation
+        :raises ValueError: If type_name is invalid
+        :raises TypeError: If handler does not implement AbstractWriter
+        """
+        # 1. Validate Type Name
+        if not isinstance(type_name, str) or not type_name.strip():
+            raise ValueError(f"Writer type name must be a non-empty string. Received: '{type_name}'")
+
+        # 2. Validate Handler Type
+        if not isinstance(handler, AbstractWriter):
+            raise TypeError(
+                f"Invalid handler for writer '{type_name}'. "
+                f"Expected AbstractWriter instance, got {type(handler).__name__}."
+            )
+
+        # 3. Collision Detection
+        if type_name in self._writers:
+            self.logger.warning(f"CRITICAL: Overwriting existing Writer plugin with name: '{type_name}'")
+        else:
+            self.logger.info(f"Successfully registered Writer plugin: '{type_name}'")
+
         self._writers[type_name] = handler
+
+    def register_anonymizer(self, type_name: str, handler: AbstractAnonymizer):
+        """
+        Manually registers a custom anonymizer plugin at runtime.
+
+        :param name: The 'action' key used in the JSON security policy
+                     (e.g., 'my_custom_mask')
+        :param handler: An instance of a class inheriting from AbstractAnonymizer
+        """
+        # 1. Validate Type Name
+        if not isinstance(type_name, str) or not type_name.strip():
+            raise ValueError(f"Anonymizer type name must be a non-empty string. Received: '{type_name}'")
+
+        # Type checking ensures the user provides a valid plugin
+        if not isinstance(handler, AbstractAnonymizer):
+            raise TypeError(f"Handler for '{type_name}' must inherit from AbstractAnonymizer")
+
+        self._anonymizers[type_name] = handler
+        self.logger.info(f"Manually registered Anonymizer Plugin: {type_name}")
 
     @trace_execution
     def run(self):
@@ -104,9 +184,9 @@ class PipelineEngine:
 
         # Add Readers as base nodes (they have no dependencies)
         for r_cfg in self.config.reader.values():
-            ts.add(r_sing_name := r_cfg.view_name)
+            ts.add(r_cfg.view_name)
         # Add Transformations and their dependency edges
-        for t_id, t_cfg in self.config.transformation.items():
+        for t_cfg in self.config.transformation:
             if t_cfg.depends_on:
                 ts.add(t_cfg.view_name, *t_cfg.depends_on)
             else:
@@ -129,7 +209,7 @@ class PipelineEngine:
                 continue
 
             # --- ROLE 2: Is this view a Transformation? ---
-            trans_match = next((t for t_id, t in self.config.transformation.items()
+            trans_match = next((t for t in self.config.transformation
                                 if t.view_name == current_view), None)
             if trans_match:
                 self._run_transformation_step(trans_match)
@@ -159,6 +239,11 @@ class PipelineEngine:
         df.createOrReplaceTempView(r_cfg.view_name)
 
     def _run_transformation_step(self, t_cfg):
+        # Use the helper property we created in the model!
+        output_view = t_cfg.effective_view_name
+        if not output_view:
+            raise ValueError(f"Transformation {t_cfg.id} has no output view defined!")
+
         if t_cfg.type == 'sql':
             self.logger.info(f"Executing SQL Transformation: {t_cfg.view_name}")
             # Use the engine's environment to render templates (handles ref + tokens)
@@ -166,8 +251,31 @@ class PipelineEngine:
             rendered_sql = template.render()
             self.spark.sql(rendered_sql).createOrReplaceTempView(t_cfg.view_name)
 
+        elif t_cfg.type == 'anonymize':
+            source = t_cfg.source_view
+            self.logger.info(f"Executing Anonymization: {output_view}")
+            # 1. Resolve the policy (Inheritance + Reference logic)
+            active_policy = self._resolve_security_policy(t_cfg)
+            # 2. Load source data
+            df = self.spark.table(source)
+
+            if not active_policy:
+                self.logger.warning("No policy applied. Copying raw data.")
+                df.createOrReplaceTempView(output_view)
+                return
+
+            # 3. Apply the resolved policy
+            for col_name, rule in active_policy.items():
+                handler = self._anonymizers.get(rule['action'])
+                if handler:
+                    self.logger.info(f"Applying {rule['action']} to {col_name}")
+                    df = handler.apply(df, col_name, rule)
+                else:
+                    self.logger.error(f"Handler for {rule['action']} not found!")
+
+            df.createOrReplaceTempView(output_view)
         elif t_cfg.type == 'python':
-            self.logger.info(f"Executing Python Transformation: {t_cfg.view_name}")
+            self.logger.info(f"Executing Python Transformation: {output_view}")
             if not t_cfg.function_path:
                 raise ValueError("python_step requires a function_path")
 
@@ -181,7 +289,7 @@ class PipelineEngine:
                 result_df = user_func(self.spark, input_dfs[0], self.tokens)
             else:
                 result_df = user_func(self.spark, *input_dfs, self.tokens)
-            result_df.createOrReplaceTempView(t_cfg.view_name)
+            result_df.createOrReplaceTempView(output_view)
 
     def _run_writer_step(self, w_cfg):
         handler = self._writers.get(w_cfg.type)
@@ -189,3 +297,73 @@ class PipelineEngine:
             raise ValueError(f"No writer registered for type: {w_cfg.type}")
         self.logger.info(f"Executing Writer: {w_cfg.write_view_name}")
         handler.write(self.spark, w_cfg, self.config.transformation)
+
+    def _resolve_security_policy(self, transformation_cfg):
+        """
+        Resolves policy using three modes:
+        1. Inline: Policy is defined directly in the transformation step.
+        2. Reference: Policy refers to a 'policy_ref' in security_templates.
+        3. Inheritance: A template uses 'extends' to inherit from another template.
+        """
+        resolved_policy = {}
+
+        # Corrected: Use the passed argument `transformation_cfg`
+        # instead of the undefined `transformation_template`
+
+        # MODE 1: Inline Policy (Highest priority)
+        if hasattr(transformation_cfg, 'inline_policy') and transformation_cfg.inline_policy:
+            self.logger.info("Using inline security policy definition.")
+            resolved_policy = transformation_cfg.inline_policy
+
+        # MODE 2: Reference Policy (Look up in templates)
+        elif hasattr(transformation_cfg,
+                     'policy_ref') and transformation_cfg.policy_ref:  # Check if your model uses policy_ref or pol_ref
+            policy_id = transformation_cfg.policy_ref
+            self.logger.info(f"Resolving policy reference: {policy_id}")
+            resolved_policy = self._get_template_recursive(policy_id)
+
+        else:
+            self.logger.warning("No security policy provided for this transformation.")
+            return {}
+
+        return resolved_policy
+
+    def _get_template_recursive(self, template_id):
+        """
+        The recursive engine that handles the 'extends' keyword.
+        """
+        if template_id not in self.config.security_templates:
+            raise ValueError(f"Security template '{template_id}' not found.")
+
+        current_template = copy.deepcopy(self.config.security_templates[template_id])
+
+        # Check if this template inherits from another
+        if "extends" in current_template:
+            parent_id = current_template["extends"]
+            self.logger.info(f"Template '{template_id}' extends '{parent_id}'")
+
+            # 1. Get the parent policy (recursively)
+            parent_policy = self._get_template_recursive(parent_id)
+
+            # 2. Merge: Parent is base, Current template overrides it
+            # We remove the 'extends' key so it doesn't interfere with Spark logic
+            del current_template["extends"]
+
+            # Deep merge parent and child
+            merged_policy = self._deep_merge(parent_policy, current_template)
+            return merged_policy
+
+        return current_template
+
+    def _deep_merge(self, base_dict, override_dict):
+        """
+        Standard deep merge utility to ensure nested dicts (like params)
+        are merged rather than overwritten.
+        """
+        result = copy.deepcopy(base_dict)
+        for key, value in override_dict.items():
+            if isinstance(value, dict) and key in result and isinstance(result[key], dict):
+                result[key] = self._deep_merge(result[key], value)
+            else:
+                result[key] = copy.deepcopy(value)
+        return result
