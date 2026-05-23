@@ -14,6 +14,7 @@ class AbstractReader(ABC):
         """Code generation logic for the compiler."""
         pass
 
+
 class AbstractWriter(ABC):
     @abstractmethod
     def write(self, spark: SparkSession, config: Any, transformations: dict) -> None: pass
@@ -23,6 +24,14 @@ class AbstractWriter(ABC):
         """Code generation logic for the compiler."""
         pass
 
+
 class AbstractStep(ABC):
     @abstractmethod
     def execute(self, spark: SparkSession, config: Any, context: dict) -> DataFrame: pass
+
+
+class AbstractAnonymizer(ABC):
+    @abstractmethod
+    def apply(self, df: DataFrame, params: dict) -> DataFrame:
+        """Apptains a specific masking/encryption logic to the dataframe."""
+        pass
